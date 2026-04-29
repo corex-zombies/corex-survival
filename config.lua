@@ -42,6 +42,51 @@ Config.Effects = {
     coughCooldown = 15000,
 }
 
+-- =============================================================================
+-- Cold (consumed by skill `s_cold` via mods.coldDamage)
+-- =============================================================================
+-- Cold accumulates as a 0..100 stat (just like hunger/thirst/infection). It
+-- ticks UP while in a cold zone, ticks DOWN once the player leaves. Once it
+-- crosses Config.Cold.damageThreshold, HP starts dropping every tick.
+-- The stat is shown live on the HUD's blue snowflake meter (corex-hud).
+-- s_cold halves the rise rate AND halves the HP damage at the threshold.
+Config.Cold = {
+    enabled            = true,
+    tickInterval       = 5000,    -- check every 5s
+
+    -- Stat behaviour
+    riseRate           = 4,       -- +N per tick while inside a cold zone
+    decayRate          = 6,       -- -N per tick while outside
+    damageThreshold    = 70,      -- once cold >= 70, HP starts dropping
+    damagePerTick      = 3,       -- HP lost per tick when above the threshold
+    maxValue           = 100,
+
+    -- Detection
+    altitudeThreshold  = 600.0,   -- meters z; ~Mt Chiliad summit area
+    notifyOnEnter      = true,
+    notifyOnDamage     = true,
+
+    -- Optional explicit cold polygons. Each entry: { coords = vec3, radius = m, riseBoost = 1.0 }
+    ColdZones = {
+        -- Example: { coords = vec3(450.0, 5570.0, 780.0), radius = 800.0, riseBoost = 1.0 },
+    }
+}
+
+-- =============================================================================
+-- Bleeding (consumed by skill `s_bleed` via mods.bleedRate, stopped by bandage)
+-- =============================================================================
+-- A single hit above HitThreshold flips the player into "bleeding". HP then
+-- drains at DrainPerTick / bleedRate-mod every TickInterval ms until a bandage
+-- (or any health item) is consumed, OR until BleedDurationMs elapses.
+Config.Bleed = {
+    enabled         = true,
+    hitThreshold    = 30,         -- single damage event >= 30 starts a bleed
+    tickInterval    = 5000,       -- 5s between drains
+    drainPerTick    = 2,          -- 2 HP lost per tick
+    durationMs      = 120000,     -- naturally stops after 2 minutes
+    notifyOnStart   = true
+}
+
 Config.Items = {
     ['canned_food']  = { stat = 'hunger',    amount = 35 },
     ['raw_meat']     = { stat = 'hunger',    amount = 15,  infectionRisk = 0.10 },

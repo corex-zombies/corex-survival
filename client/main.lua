@@ -220,6 +220,13 @@ CreateThread(function()
     end
 end)
 
+-- ---------------------------------------------------------------------------
+-- Regen-gate state (declared up-here so handlers below can reference it).
+-- The actual gate-flip logic + per-frame blocker thread sit further down.
+-- ---------------------------------------------------------------------------
+local activeDamageStates = { cold = false, bleeding = false }
+local gate = { enabled = false, lastHp = 200 }
+
 RegisterNetEvent('corex-survival:client:applyHealthDelta', function(amount)
     if not isReady then return end
     local ped = Corex.Functions.GetPed()
@@ -227,17 +234,214 @@ RegisterNetEvent('corex-survival:client:applyHealthDelta', function(amount)
     local current = GetEntityHealth(ped)
     local clamped = math.max(0, math.min(200, current + (tonumber(amount) or 0)))
     SetEntityHealth(ped, clamped)
+    -- Sync the regen-gate snapshot so intentional heals (bandage / medkit /
+    -- antidote bonus) AND intentional damage (cold / bleed tick) both pass
+    -- through cleanly without being reverted by the per-frame blocker.
+    gate.lastHp = clamped
 end)
 
 RegisterNetEvent('corex-survival:client:zombieHit', function()
     if not isReady or not Config.Infection.enabled then return end
     if currentInfection > 0 then return end
 
-    local roll = math.random()
-    if roll <= Config.Infection.biteChance then
-        Corex.Functions.Notify('You feel a burning sensation from the bite...', 'warning', 5000)
-        TriggerServerEvent('corex-survival:server:zombieHit')
+    -- Server is authoritative for the bite-chance roll (so corex-skills can
+    -- apply biteChance / biteImmunity modifiers without the client cheating).
+    -- We just report the hit; the server decides infection.
+    TriggerServerEvent('corex-survival:server:zombieHit')
+end)
+
+-- ---------------------------------------------------------------------------
+-- Bleeding detection — watch HP delta, report big hits to server
+-- ---------------------------------------------------------------------------
+-- Track HP per frame. If HP drops by more than Config.Bleed.hitThreshold in
+-- a single frame, that's a "big hit" and we ask the server to start a bleed.
+-- Server re-validates so a bad client can't trigger this falsely.
+CreateThread(function()
+    while not isReady do Wait(500) end
+    local lastHp = GetEntityHealth(PlayerPedId())
+    while true do
+        Wait(250)
+        if Config.Bleed and Config.Bleed.enabled and Corex.Functions.IsAlive() then
+            local ped = PlayerPedId()
+            local hp  = GetEntityHealth(ped)
+            local delta = lastHp - hp
+            if delta >= (Config.Bleed.hitThreshold or 30) then
+                TriggerServerEvent('corex-survival:server:reportHit', delta)
+            end
+            lastHp = hp
+        end
     end
+end)
+
+-- ---------------------------------------------------------------------------
+-- Cold zone detection — periodic coords report to the server
+-- ---------------------------------------------------------------------------
+-- Cheap altitude check + periodic coords post. Server decides damage so the
+-- s_cold skill modifier can be applied authoritatively.
+CreateThread(function()
+    while not isReady do Wait(1000) end
+    while true do
+        local interval = (Config.Cold and Config.Cold.tickInterval) or 8000
+        Wait(interval)
+        if Config.Cold and Config.Cold.enabled and Corex.Functions.IsAlive() then
+            local ped = PlayerPedId()
+            local coords = GetEntityCoords(ped)
+            TriggerServerEvent('corex-survival:server:reportColdCheck', coords)
+        end
+    end
+end)
+
+-- ---------------------------------------------------------------------------
+-- Health-regen gate (HARD blocker)
+-- ---------------------------------------------------------------------------
+-- The vanilla `SetPlayerHealthRechargeMultiplier` native turned out not to
+-- fully disable regen — HP still ticked back up while the player was
+-- freezing. So we run a manual blocker as the source of truth:
+--
+--   * `gate.enabled` flips ON whenever cold ≥ damage-threshold OR the player
+--     is bleeding.
+--   * A per-frame thread snapshots the player's HP. If HP went UP between
+--     frames and the gate is enabled, we revert it to the previous value.
+--   * Intentional heals (bandage / medkit / cold damage = negative delta)
+--     come through `applyHealthDelta` — that handler updates the snapshot
+--     itself so legitimate heals aren't reverted.
+--
+-- This works regardless of what's trying to regen — vanilla GTA, third-
+-- party scripts, custom regen — all are clamped while damage is active.
+-- (`activeDamageStates` and `gate` are declared near the top of the file
+-- so the applyHealthDelta handler — which fires before this block executes
+-- at load time — can update gate.lastHp without a nil-index error.)
+
+local function ApplyRegenGate()
+    local anyActive = activeDamageStates.cold or activeDamageStates.bleeding
+    if anyActive ~= gate.enabled then
+        gate.enabled = anyActive
+        local ped = PlayerPedId()
+        if ped and ped ~= 0 then
+            gate.lastHp = GetEntityHealth(ped)
+        end
+        if Config.Debug then
+            print(('^3[COREX-SURVIVAL]^7 regen-gate %s (cold=%s bleed=%s lastHp=%d)^0'):format(
+                anyActive and 'ENABLED' or 'disabled',
+                tostring(activeDamageStates.cold),
+                tostring(activeDamageStates.bleeding),
+                gate.lastHp))
+        end
+    end
+end
+
+-- ALWAYS-RUNNING blocker. Ticks every frame regardless of gate state — when
+-- the gate is open, lastHp tracks HP normally; the moment the gate flips
+-- on, the next frame catches any vanilla regen and reverts. While the gate
+-- is on we also hammer the recharge native so engine regen stays disabled.
+--
+-- DEATH SAFETY: on the first frame after a respawn (dead → alive transition)
+-- we always overwrite lastHp with the new full HP. Otherwise lastHp would
+-- still hold the pre-death value (likely 0 or very low) and the blocker
+-- would immediately murder the freshly-respawned player back to that value
+-- — the "death loop" the user reported.
+CreateThread(function()
+    while not isReady do Wait(500) end
+    local wasDead = true   -- start as 'dead' so first alive frame resets
+
+    while true do
+        local ped = PlayerPedId()
+        if ped ~= 0 then
+            local isDead = IsEntityDead(ped) or IsPedFatallyInjured(ped)
+
+            if isDead then
+                wasDead = true
+            else
+                local hp = GetEntityHealth(ped)
+
+                -- Respawn / first alive frame: reset the snapshot. Without
+                -- this the blocker would try to clamp the new full HP back
+                -- down to the value the player had when they died.
+                if wasDead then
+                    wasDead = false
+                    gate.lastHp = hp
+                    if Config.Debug then
+                        print(('^3[COREX-SURVIVAL]^7 respawn detected, resetting gate.lastHp=%d^0'):format(hp))
+                    end
+                elseif gate.enabled then
+                    -- Lock engine regen every frame.
+                    SetPlayerHealthRechargeMultiplier(PlayerId(), 0.0)
+                    SetPlayerHealthRechargeLimit(PlayerId(), 0.0)
+
+                    if hp > gate.lastHp then
+                        SetEntityHealth(ped, gate.lastHp)
+                    else
+                        gate.lastHp = hp
+                    end
+                else
+                    gate.lastHp = hp
+                end
+            end
+        end
+        Wait(0)
+    end
+end)
+
+-- Bleed start/stop fire from the server. Toggle the regen gate.
+RegisterNetEvent('corex-survival:client:onBleedStart', function()
+    activeDamageStates.bleeding = true
+    ApplyRegenGate()
+end)
+RegisterNetEvent('corex-survival:client:onBleedStop', function()
+    activeDamageStates.bleeding = false
+    ApplyRegenGate()
+end)
+
+-- Cold drives the gate via two paths:
+--   1) state-bag change handler (instant reaction when cold value changes)
+--   2) a 1-second poll on the player's metadata (insurance if the handler
+--      ever misses an update, e.g. when entering scope or reconnecting).
+-- We OR them together so as long as one path sees cold ≥ threshold, the
+-- gate engages.
+CreateThread(function()
+    while not Corex do Wait(200) end
+    while not NetworkIsPlayerActive(PlayerId()) do Wait(200) end
+    local serverId = GetPlayerServerId(PlayerId())
+    local playerBag = ('player:%s'):format(serverId)
+
+    local function setColdActive(active)
+        if active ~= activeDamageStates.cold then
+            activeDamageStates.cold = active
+            ApplyRegenGate()
+        end
+    end
+
+    AddStateBagChangeHandler('cold', playerBag, function(_, _, value)
+        local v = tonumber(value) or 0
+        local threshold = (Config.Cold and Config.Cold.damageThreshold) or 70
+        setColdActive(v >= threshold)
+    end)
+
+    -- Polling fallback — reads the state-bag (or metadata) directly. The
+    -- state-bag handler should normally fire first, but if for any reason
+    -- the bag isn't subscribed to (timing, scope, dropout), this loop keeps
+    -- the gate honest.
+    CreateThread(function()
+        while true do
+            Wait(1000)
+            if isReady and Corex and Corex.Functions and Corex.Functions.GetMetaData then
+                local meta = Corex.Functions.GetMetaData()
+                local cold = (meta and tonumber(meta.cold)) or 0
+                local threshold = (Config.Cold and Config.Cold.damageThreshold) or 70
+                setColdActive(cold >= threshold)
+            end
+        end
+    end)
+end)
+
+-- Optional cosmetic FX. The server fires these on enter/leave; we only do a
+-- light timecycle tweak so the player visibly knows they're in a cold zone.
+RegisterNetEvent('corex-survival:client:onColdEnter', function()
+    SetTimecycleModifier('CAMERA_secuirity_FUZZ')
+    SetTimecycleModifierStrength(0.25)
+end)
+RegisterNetEvent('corex-survival:client:onColdLeave', function()
+    ClearTimecycleModifier()
 end)
 
 RegisterNetEvent('corex-inventory:client:useItem', function(itemName, itemData)
@@ -249,8 +453,24 @@ RegisterNetEvent('corex-inventory:client:useItem', function(itemName, itemData)
     TriggerServerEvent('corex-survival:server:useItem', itemName)
 end)
 
+-- On respawn, the engine wipes any per-frame natives we set. Re-evaluate
+-- the gate so a player who died on the mountain still gets locked the
+-- moment they respawn back into the cold.
+AddEventHandler('playerSpawned', function()
+    SetTimeout(500, function()
+        -- Force a state recheck so the gate flips correctly.
+        gate.enabled = not (activeDamageStates.cold or activeDamageStates.bleeding)
+        ApplyRegenGate()
+    end)
+end)
+
 AddEventHandler('onResourceStop', function(resourceName)
     if GetCurrentResourceName() ~= resourceName then return end
+
+    -- Restore vanilla regen so the player isn't stuck without it if the
+    -- resource crashes or is hot-reloaded.
+    SetPlayerHealthRechargeMultiplier(PlayerId(), 1.0)
+    SetPlayerHealthRechargeLimit(PlayerId(), 0.5)
 
     ClearTimecycleModifier()
     StopGameplayCamShaking(true)

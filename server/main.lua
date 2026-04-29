@@ -6,6 +6,22 @@ local lastDrainTick = {}
 local lastUseItem = {}
 local USE_ITEM_COOLDOWN = 500
 
+-- Pull modifiers from corex-skills if it's running. Returns a neutral table
+-- when the resource is missing so callers can multiply blindly.
+local NEUTRAL_MODS = {
+    infectionGrowth = 1.0, hungerDrain = 1.0, thirstDrain = 1.0,
+    biteChance = 1.0, plagueResist = 0.0, biteImmunity = false,
+    bandageHeal = 1.0, antibioticPower = 1.0
+}
+
+local function GetSkillMods(src)
+    local ok, mods = pcall(function()
+        return exports['corex-skills']:GetModifiers(src)
+    end)
+    if ok and type(mods) == 'table' then return mods end
+    return NEUTRAL_MODS
+end
+
 local function InitCore()
     local success, core = pcall(function()
         return exports['corex-core']:GetCoreObject()
@@ -80,7 +96,10 @@ CreateThread(function()
                     if infection <= 0 then
                         infectionTimers[source] = nil
                     else
-                        local newInfection = math.min(100, infection + Config.Infection.growthRate)
+                        -- Skill modifier: hardened-immunity branch slows infection growth.
+                        local mods = GetSkillMods(source)
+                        local growth = Config.Infection.growthRate * (mods.infectionGrowth or 1.0)
+                        local newInfection = math.min(100, infection + growth)
                         SetStat(source, 'infection', newInfection)
 
                         if newInfection >= 100 then
@@ -127,8 +146,10 @@ RegisterNetEvent('corex-survival:server:drainTick', function()
     local hunger = GetStat(src, 'hunger')
     local thirst = GetStat(src, 'thirst')
 
-    local newHunger = math.max(0, hunger - Config.Hunger.drainRate)
-    local newThirst = math.max(0, thirst - Config.Thirst.drainRate)
+    -- Skill modifier: iron-stomach / camel-body slow hunger and thirst drain.
+    local mods = GetSkillMods(src)
+    local newHunger = math.max(0, hunger - Config.Hunger.drainRate * (mods.hungerDrain or 1.0))
+    local newThirst = math.max(0, thirst - Config.Thirst.drainRate * (mods.thirstDrain or 1.0))
 
     SetStat(src, 'hunger', newHunger)
     SetStat(src, 'thirst', newThirst)
@@ -151,6 +172,20 @@ RegisterNetEvent('corex-survival:server:zombieHit', function()
     local currentInfection = GetStat(src, 'infection')
     if currentInfection > 0 then return end
 
+    -- Bite chance roll happens here (server-authoritative). Skills can either
+    -- multiply biteChance (1.0 → 0.5 with s_plague) or grant biteImmunity
+    -- (s_immunity), in which case bites never cause infection.
+    local mods = GetSkillMods(src)
+    if mods.biteImmunity then
+        Corex.Functions.Notify(src, 'You shrugged off the bite.', 'info', 2500)
+        return
+    end
+
+    local effectiveChance = (Config.Infection.biteChance or 0) * (mods.biteChance or 1.0)
+    if math.random() > effectiveChance then
+        return
+    end
+
     local startValue = Config.Infection.growthRate
     SetStat(src, 'infection', startValue)
     Corex.Functions.Notify(src, 'You have been infected!', 'error', 5000)
@@ -172,6 +207,17 @@ RegisterNetEvent('corex-survival:server:useItem', function(itemName)
     local itemConfig = Config.Items[itemName]
     if not itemConfig then return end
 
+    -- Read crafted-quality metadata BEFORE consumption so we can scale the
+    -- effect. Items crafted with k_solid / k_master carry a qualityBonus.
+    local craftQuality = 0.0
+    local metaOk, meta = pcall(function()
+        return exports['corex-inventory']:GetItemMeta(src, itemName)
+    end)
+    if metaOk and type(meta) == 'table' and tonumber(meta.qualityBonus) then
+        craftQuality = tonumber(meta.qualityBonus) or 0.0
+    end
+    local qualityMul = 1.0 + craftQuality   -- 1.0 = vanilla; 1.30 with k_solid; 1.495 stacked
+
     local removeOk, removed = pcall(function()
         return exports['corex-inventory']:RemoveItem(src, itemName, 1)
     end)
@@ -182,46 +228,65 @@ RegisterNetEvent('corex-survival:server:useItem', function(itemName)
     end
 
     if itemConfig.stat == 'hunger' then
+        -- qualityMul scales food crafted with k_solid / k_master (more nutritious).
         local current = GetStat(src, 'hunger')
-        local newVal = math.min(Config.Hunger.maxValue, current + itemConfig.amount)
+        local amount = math.floor((tonumber(itemConfig.amount) or 0) * qualityMul)
+        local newVal = math.min(Config.Hunger.maxValue, current + amount)
         SetStat(src, 'hunger', newVal)
-        Corex.Functions.Notify(src, 'Hunger restored (+' .. itemConfig.amount .. ')', 'success', 2000)
+        Corex.Functions.Notify(src, 'Hunger restored (+' .. amount .. ')', 'success', 2000)
 
     elseif itemConfig.stat == 'thirst' then
         local current = GetStat(src, 'thirst')
-        local newVal = math.min(Config.Thirst.maxValue, current + itemConfig.amount)
+        local amount = math.floor((tonumber(itemConfig.amount) or 0) * qualityMul)
+        local newVal = math.min(Config.Thirst.maxValue, current + amount)
         SetStat(src, 'thirst', newVal)
-        Corex.Functions.Notify(src, 'Thirst restored (+' .. itemConfig.amount .. ')', 'success', 2000)
+        Corex.Functions.Notify(src, 'Thirst restored (+' .. amount .. ')', 'success', 2000)
 
     elseif itemConfig.stat == 'health' then
         if itemConfig.fullHeal then
             Corex.Functions.SetPlayerHealth(src, 200)
             Corex.Functions.Notify(src, 'Fully healed', 'success', 2000)
         else
-            local amount = tonumber(itemConfig.amount) or 0
+            -- Skill modifier: field-medic / bandageHeal scales heal amount.
+            -- Quality multiplier (k_solid / k_master) stacks on top.
+            local mods = GetSkillMods(src)
+            local amount = math.floor((tonumber(itemConfig.amount) or 0) * (mods.bandageHeal or 1.0) * qualityMul)
             TriggerClientEvent('corex-survival:client:applyHealthDelta', src, amount)
             Corex.Functions.Notify(src, 'Health restored (+' .. amount .. ')', 'success', 2000)
         end
+        -- Any health item also stops an active bleed (consumed by s_bleed system).
+        TriggerEvent('corex-survival:server:onBandageUsed', src)
 
     elseif itemConfig.stat == 'infection' then
         if itemConfig.cure then
+            -- Capture old infection BEFORE wiping it so the XP award knows
+            -- whether this was a meaningful save (>= 50%).
+            local oldInfection = GetStat(src, 'infection')
             SetStat(src, 'infection', 0)
             StopInfectionGrowth(src)
             painkillerTimers[src] = nil
             Corex.Functions.Notify(src, 'Infection cured!', 'success', 3000)
+            TriggerEvent('corex-survival:server:onInfectionCured', src, oldInfection)
 
         elseif itemConfig.pause then
             StartPainkillerTimer(src, itemConfig.pause)
             Corex.Functions.Notify(src, 'Painkillers active - infection paused', 'info', 3000)
 
         elseif itemConfig.reduce then
+            -- Skill modifier: pharmacist / antibioticPower scales the cure amount.
+            -- Stacks with quality bonus from the crafter.
+            local mods = GetSkillMods(src)
+            local reduce = math.floor((tonumber(itemConfig.reduce) or 0) * (mods.antibioticPower or 1.0) * qualityMul)
             local current = GetStat(src, 'infection')
-            local newVal = math.max(0, current - itemConfig.reduce)
+            local newVal = math.max(0, current - reduce)
             SetStat(src, 'infection', newVal)
             if newVal <= 0 then
                 StopInfectionGrowth(src)
+                if current >= 50 then
+                    TriggerEvent('corex-survival:server:onInfectionCured', src, current)
+                end
             end
-            Corex.Functions.Notify(src, 'Infection reduced (-' .. itemConfig.reduce .. ')', 'success', 3000)
+            Corex.Functions.Notify(src, 'Infection reduced (-' .. reduce .. ')', 'success', 3000)
         end
     end
 
@@ -248,6 +313,167 @@ AddEventHandler('corex:server:playerReady', function(source, player)
     end
 end)
 
+-- =============================================================================
+-- Bleeding subsystem (skill: s_bleed -> mods.bleedRate)
+-- =============================================================================
+-- A single damage event >= Config.Bleed.hitThreshold flips the player into
+-- "bleeding". HP drains over time until either:
+--   * Config.Bleed.durationMs elapses, OR
+--   * the player consumes a health item (bandage / medkit) — handled in the
+--     useItem handler above where we already detect itemConfig.stat='health'.
+-- bleedRate modifier scales the time between drain ticks (lower = stops faster).
+local bleedingPlayers = {}  -- [src] = { startedAt = ms, lastDrainAt = ms }
+
+local function StartBleeding(src)
+    if not Config.Bleed or not Config.Bleed.enabled then return end
+    if bleedingPlayers[src] then return end
+    bleedingPlayers[src] = { startedAt = GetGameTimer(), lastDrainAt = GetGameTimer() }
+    if Config.Bleed.notifyOnStart and Corex and Corex.Functions then
+        Corex.Functions.Notify(src, 'You are bleeding — find a bandage!', 'error', 4500)
+        TriggerClientEvent('corex-survival:client:onBleedStart', src)
+    end
+end
+
+local function StopBleeding(src, silent)
+    if not bleedingPlayers[src] then return end
+    bleedingPlayers[src] = nil
+    if not silent and Corex and Corex.Functions then
+        Corex.Functions.Notify(src, 'Bleeding has stopped.', 'success', 3000)
+        TriggerClientEvent('corex-survival:client:onBleedStop', src)
+    end
+end
+
+-- Client reports being hit hard. We re-check threshold server-side so a
+-- bad client can't fake a high-damage hit to spam bleeds.
+RegisterNetEvent('corex-survival:server:reportHit', function(damage)
+    local src = source
+    if not Config.Bleed or not Config.Bleed.enabled then return end
+    damage = tonumber(damage) or 0
+    if damage < (Config.Bleed.hitThreshold or 30) then return end
+    StartBleeding(src)
+end)
+
+-- Bleed tick: drains HP for everyone currently bleeding.
+CreateThread(function()
+    while not Corex do Wait(500) end
+    while true do
+        Wait(1500)
+        if not Config.Bleed or not Config.Bleed.enabled then
+            -- check again later in case it gets toggled
+            Wait(5000)
+        else
+            local now = GetGameTimer()
+            for src, st in pairs(bleedingPlayers) do
+                if (now - st.startedAt) > (Config.Bleed.durationMs or 120000) then
+                    StopBleeding(src, false)
+                else
+                    local mods = GetSkillMods(src)
+                    local rate = mods.bleedRate or 1.0  -- lower = drains slower & ends sooner
+                    local effectiveTick = (Config.Bleed.tickInterval or 5000) / math.max(0.1, rate)
+                    if (now - st.lastDrainAt) >= effectiveTick then
+                        st.lastDrainAt = now
+                        local drain = math.floor((Config.Bleed.drainPerTick or 2) * rate)
+                        if drain > 0 then
+                            TriggerClientEvent('corex-survival:client:applyHealthDelta', src, -drain)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- Stop bleed automatically when the player consumes any health item.
+-- (Wired into the existing useItem handler.)
+AddEventHandler('corex-survival:server:onBandageUsed', function(src)
+    StopBleeding(src, false)
+end)
+
+-- =============================================================================
+-- Cold subsystem (skill: s_cold -> mods.coldDamage)
+-- =============================================================================
+-- Cold is a 0..100 stat (mirrors hunger/thirst/infection). It rises while
+-- the player is in a cold zone, decays while they're out. When it crosses
+-- Config.Cold.damageThreshold, HP starts dropping. The HUD's blue snowflake
+-- meter is driven by the existing 'cold' state-bag key, so just keeping the
+-- stat updated server-side is enough for the visual.
+local coldState = {}  -- [src] = { lastTickAt, inZoneAt, notifiedDamage }
+
+local function IsInColdArea(coords)
+    if not Config.Cold or not Config.Cold.enabled then return false, 1.0 end
+    if not coords then return false, 1.0 end
+    if coords.z and coords.z >= (Config.Cold.altitudeThreshold or 600.0) then
+        return true, 1.0
+    end
+    for _, zone in ipairs(Config.Cold.ColdZones or {}) do
+        local zc = zone.coords
+        if zc then
+            local dx, dy, dz = coords.x - zc.x, coords.y - zc.y, (coords.z or 0) - (zc.z or 0)
+            local r = zone.radius or 100.0
+            if (dx*dx + dy*dy + dz*dz) <= (r * r) then
+                return true, (zone.riseBoost or 1.0)
+            end
+        end
+    end
+    return false, 1.0
+end
+
+RegisterNetEvent('corex-survival:server:reportColdCheck', function(coords)
+    local src = source
+    if not Config.Cold or not Config.Cold.enabled then return end
+    if type(coords) ~= 'vector3' and type(coords) ~= 'table' then return end
+
+    local now = GetGameTimer()
+    local st = coldState[src] or { lastTickAt = 0, inZoneAt = nil, notifiedDamage = false }
+    coldState[src] = st
+
+    -- Server-side rate limit: ignore reports faster than the configured tick.
+    if (now - st.lastTickAt) < ((Config.Cold.tickInterval or 5000) - 500) then return end
+    st.lastTickAt = now
+
+    local inCold, riseBoost = IsInColdArea(coords)
+    local mods = GetSkillMods(src)
+    local coldMul = mods.coldDamage or 1.0   -- s_cold = 0.5 → halves rise + damage
+
+    local cur = GetStat(src, 'cold') or 0
+    local maxVal = Config.Cold.maxValue or 100
+
+    if inCold then
+        -- Entering / staying in cold zone: stat ticks UP (slower with s_cold).
+        if not st.inZoneAt then
+            st.inZoneAt = now
+            if Config.Cold.notifyOnEnter and Corex and Corex.Functions then
+                Corex.Functions.Notify(src, 'You are entering a cold area...', 'warning', 3500)
+            end
+            TriggerClientEvent('corex-survival:client:onColdEnter', src)
+        end
+        local rise = math.max(1, math.floor((Config.Cold.riseRate or 4) * coldMul * (riseBoost or 1.0)))
+        local newVal = math.min(maxVal, cur + rise)
+        SetStat(src, 'cold', newVal)
+
+        -- Above the damage threshold? HP starts dropping (also halved by s_cold).
+        if newVal >= (Config.Cold.damageThreshold or 70) then
+            local dmg = math.max(1, math.floor((Config.Cold.damagePerTick or 3) * coldMul))
+            TriggerClientEvent('corex-survival:client:applyHealthDelta', src, -dmg)
+            if not st.notifiedDamage and Config.Cold.notifyOnDamage and Corex and Corex.Functions then
+                Corex.Functions.Notify(src, 'You are freezing! Find shelter!', 'error', 4000)
+                st.notifiedDamage = true
+            end
+        end
+    else
+        -- Out of cold: the stat decays to zero so the HUD meter empties.
+        if cur > 0 then
+            local newVal = math.max(0, cur - (Config.Cold.decayRate or 6))
+            SetStat(src, 'cold', newVal)
+        end
+        if st.inZoneAt then
+            st.inZoneAt = nil
+            st.notifiedDamage = false
+            TriggerClientEvent('corex-survival:client:onColdLeave', src)
+        end
+    end
+end)
+
 -- Cleanup on player drop
 AddEventHandler('playerDropped', function()
     local src = source
@@ -256,6 +482,8 @@ AddEventHandler('playerDropped', function()
     lastDrainTick[src] = nil
     lastUseItem[src] = nil
     lastZombieHit[src] = nil
+    bleedingPlayers[src] = nil
+    coldState[src] = nil
 end)
 
 -- Admin commands
