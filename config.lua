@@ -81,6 +81,9 @@ Config.Cold = {
 Config.Bleed = {
     enabled         = true,
     hitThreshold    = 30,         -- single damage event >= 30 starts a bleed
+    maxReportedDamage = 200,      -- reject impossible single-sample health deltas
+    healthTolerance = 8,          -- allowed client/server HP sampling drift
+    reportCooldown  = 750,        -- rate-limit damage reports per player
     tickInterval    = 5000,       -- 5s between drains
     drainPerTick    = 2,          -- 2 HP lost per tick
     durationMs      = 120000,     -- naturally stops after 2 minutes

@@ -258,18 +258,23 @@ end)
 -- Server re-validates so a bad client can't trigger this falsely.
 CreateThread(function()
     while not isReady do Wait(500) end
-    local lastHp = GetEntityHealth(PlayerPedId())
+    local lastHp = nil
     while true do
         Wait(250)
-        if Config.Bleed and Config.Bleed.enabled and Corex.Functions.IsAlive() then
-            local ped = PlayerPedId()
-            local hp  = GetEntityHealth(ped)
+        local ped = PlayerPedId()
+        local hp = ped ~= 0 and GetEntityHealth(ped) or 0
+        local canReport = Config.Bleed and Config.Bleed.enabled
+            and ped ~= 0 and hp > 100 and Corex.Functions.IsAlive()
+
+        if canReport and lastHp then
             local delta = lastHp - hp
             if delta >= (Config.Bleed.hitThreshold or 30) then
-                TriggerServerEvent('corex-survival:server:reportHit', delta)
+                TriggerServerEvent('corex-survival:server:reportHit', lastHp, hp)
             end
-            lastHp = hp
         end
+        -- Death, reconnect and respawn all establish a fresh baseline instead
+        -- of comparing the new ped against a stale health sample.
+        lastHp = hp
     end
 end)
 
@@ -458,6 +463,7 @@ end)
 -- moment they respawn back into the cold.
 AddEventHandler('playerSpawned', function()
     SetTimeout(500, function()
+        activeDamageStates.bleeding = false
         -- Force a state recheck so the gate flips correctly.
         gate.enabled = not (activeDamageStates.cold or activeDamageStates.bleeding)
         ApplyRegenGate()

@@ -322,34 +322,48 @@ end)
 --   * the player consumes a health item (bandage / medkit) — handled in the
 --     useItem handler above where we already detect itemConfig.stat='health'.
 -- bleedRate modifier scales the time between drain ticks (lower = stops faster).
-local bleedingPlayers = {}  -- [src] = { startedAt = ms, lastDrainAt = ms }
+local bleedState = BleedingState.New()
+local bleedingPlayers = bleedState.players  -- [src] = { startedAt = ms, lastDrainAt = ms }
 
 local function StartBleeding(src)
     if not Config.Bleed or not Config.Bleed.enabled then return end
-    if bleedingPlayers[src] then return end
-    bleedingPlayers[src] = { startedAt = GetGameTimer(), lastDrainAt = GetGameTimer() }
+    if not BleedingState.Start(bleedState, src, GetGameTimer()) then return end
     if Config.Bleed.notifyOnStart and Corex and Corex.Functions then
         Corex.Functions.Notify(src, 'You are bleeding — find a bandage!', 'error', 4500)
-        TriggerClientEvent('corex-survival:client:onBleedStart', src)
     end
+    TriggerClientEvent('corex-survival:client:onBleedStart', src)
 end
 
 local function StopBleeding(src, silent)
-    if not bleedingPlayers[src] then return end
-    bleedingPlayers[src] = nil
+    if not BleedingState.Stop(bleedState, src) then return end
     if not silent and Corex and Corex.Functions then
         Corex.Functions.Notify(src, 'Bleeding has stopped.', 'success', 3000)
-        TriggerClientEvent('corex-survival:client:onBleedStop', src)
     end
+    TriggerClientEvent('corex-survival:client:onBleedStop', src)
 end
 
--- Client reports being hit hard. We re-check threshold server-side so a
--- bad client can't fake a high-damage hit to spam bleeds.
-RegisterNetEvent('corex-survival:server:reportHit', function(damage)
+-- The client supplies two HP samples. The server verifies the reported final
+-- sample against the authoritative ped health and rate-limits accepted reports.
+RegisterNetEvent('corex-survival:server:reportHit', function(beforeHealth, afterHealth)
     local src = source
     if not Config.Bleed or not Config.Bleed.enabled then return end
-    damage = tonumber(damage) or 0
-    if damage < (Config.Bleed.hitThreshold or 30) then return end
+
+    local ped = GetPlayerPed(src)
+    if not ped or ped == 0 then return end
+    local serverHealth = GetEntityHealth(ped)
+    local valid = BleedingState.ValidateDamageReport(
+        beforeHealth,
+        afterHealth,
+        serverHealth,
+        Config.Bleed.hitThreshold or 30,
+        Config.Bleed.maxReportedDamage or 200,
+        Config.Bleed.healthTolerance or 8,
+        serverHealth > 100
+    )
+    if not valid then return end
+    if not BleedingState.AcceptReport(
+        bleedState, src, GetGameTimer(), Config.Bleed.reportCooldown or 750
+    ) then return end
     StartBleeding(src)
 end)
 
@@ -364,7 +378,10 @@ CreateThread(function()
         else
             local now = GetGameTimer()
             for src, st in pairs(bleedingPlayers) do
-                if (now - st.startedAt) > (Config.Bleed.durationMs or 120000) then
+                local ped = GetPlayerPed(src)
+                if not ped or ped == 0 or GetEntityHealth(ped) <= 100 then
+                    StopBleeding(src, true)
+                elseif (now - st.startedAt) > (Config.Bleed.durationMs or 120000) then
                     StopBleeding(src, false)
                 else
                     local mods = GetSkillMods(src)
@@ -387,6 +404,15 @@ end)
 -- (Wired into the existing useItem handler.)
 AddEventHandler('corex-survival:server:onBandageUsed', function(src)
     StopBleeding(src, false)
+end)
+
+-- corex-death emits this local server event for every normal and emergency death.
+-- Clearing here prevents a reconnect/respawn from inheriting a stale bleed.
+AddEventHandler('corex-spawn:server:playerDied', function(src)
+    src = tonumber(src)
+    if not src then return end
+    StopBleeding(src, true)
+    BleedingState.Reset(bleedState, src)
 end)
 
 -- =============================================================================
@@ -482,7 +508,7 @@ AddEventHandler('playerDropped', function()
     lastDrainTick[src] = nil
     lastUseItem[src] = nil
     lastZombieHit[src] = nil
-    bleedingPlayers[src] = nil
+    BleedingState.Reset(bleedState, src)
     coldState[src] = nil
 end)
 
