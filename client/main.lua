@@ -226,13 +226,18 @@ end)
 -- ---------------------------------------------------------------------------
 local activeDamageStates = { cold = false, bleeding = false }
 local gate = { enabled = false, lastHp = 200 }
+local respawnGraceUntil = 0
+local RESPAWN_FULL_HEALTH = 200
+local RESPAWN_DAMAGE_GRACE_MS = 5000
 
 RegisterNetEvent('corex-survival:client:applyHealthDelta', function(amount)
     if not isReady then return end
+    local delta = tonumber(amount) or 0
+    if delta < 0 and GetGameTimer() < respawnGraceUntil then return end
     local ped = Corex.Functions.GetPed()
     if not ped or ped == 0 then return end
     local current = GetEntityHealth(ped)
-    local clamped = math.max(0, math.min(200, current + (tonumber(amount) or 0)))
+    local clamped = math.max(0, math.min(200, current + delta))
     SetEntityHealth(ped, clamped)
     -- Sync the regen-gate snapshot so intentional heals (bandage / medkit /
     -- antidote bonus) AND intentional damage (cold / bleed tick) both pass
@@ -335,6 +340,52 @@ local function ApplyRegenGate()
     end
 end
 
+local function IsRespawnGraceActive()
+    return GetGameTimer() < respawnGraceUntil
+end
+
+-- COREX uses its own spawn pipeline, so the stock playerSpawned event is not
+-- guaranteed to run after a death. Reset both the local damage flags and the
+-- native health state at the two explicit COREX respawn boundaries instead.
+local function ResetRespawnDamageState(ensureFullHealth)
+    activeDamageStates.cold = false
+    activeDamageStates.bleeding = false
+    gate.enabled = false
+    respawnGraceUntil = GetGameTimer() + RESPAWN_DAMAGE_GRACE_MS
+
+    -- The regen blocker writes zero while damage is active. Restore GTA's
+    -- defaults explicitly so those native values cannot leak across death.
+    SetPlayerHealthRechargeMultiplier(PlayerId(), 1.0)
+    SetPlayerHealthRechargeLimit(PlayerId(), 0.5)
+
+    local ped = PlayerPedId()
+    if ped and ped ~= 0 and DoesEntityExist(ped) then
+        if ensureFullHealth then
+            SetEntityMaxHealth(ped, RESPAWN_FULL_HEALTH)
+            SetEntityHealth(ped, RESPAWN_FULL_HEALTH)
+            ClearPedBloodDamage(ped)
+            gate.lastHp = RESPAWN_FULL_HEALTH
+        else
+            gate.lastHp = GetEntityHealth(ped)
+        end
+    else
+        gate.lastHp = RESPAWN_FULL_HEALTH
+    end
+
+    return not gate.enabled
+        and not activeDamageStates.cold
+        and not activeDamageStates.bleeding
+        and (not ensureFullHealth or gate.lastHp == RESPAWN_FULL_HEALTH)
+end
+
+RegisterNetEvent('corex-death:client:prepareRespawn', function()
+    return ResetRespawnDamageState(false)
+end)
+
+RegisterNetEvent('corex-death:client:respawnFinished', function()
+    return ResetRespawnDamageState(true)
+end)
+
 -- ALWAYS-RUNNING blocker. Ticks every frame regardless of gate state — when
 -- the gate is open, lastHp tracks HP normally; the moment the gate flips
 -- on, the next frame catches any vanilla regen and reverts. While the gate
@@ -389,6 +440,7 @@ end)
 
 -- Bleed start/stop fire from the server. Toggle the regen gate.
 RegisterNetEvent('corex-survival:client:onBleedStart', function()
+    if IsRespawnGraceActive() then return end
     activeDamageStates.bleeding = true
     ApplyRegenGate()
 end)
@@ -410,6 +462,9 @@ CreateThread(function()
     local playerBag = ('player:%s'):format(serverId)
 
     local function setColdActive(active)
+        if active and IsRespawnGraceActive() then
+            active = false
+        end
         if active ~= activeDamageStates.cold then
             activeDamageStates.cold = active
             ApplyRegenGate()
@@ -458,15 +513,11 @@ RegisterNetEvent('corex-inventory:client:useItem', function(itemName, itemData)
     TriggerServerEvent('corex-survival:server:useItem', itemName)
 end)
 
--- On respawn, the engine wipes any per-frame natives we set. Re-evaluate
--- the gate so a player who died on the mountain still gets locked the
--- moment they respawn back into the cold.
+-- Compatibility fallback for resources that still emit the stock spawn event.
+-- The explicit COREX lifecycle events above remain the authoritative path.
 AddEventHandler('playerSpawned', function()
     SetTimeout(500, function()
-        activeDamageStates.bleeding = false
-        -- Force a state recheck so the gate flips correctly.
-        gate.enabled = not (activeDamageStates.cold or activeDamageStates.bleeding)
-        ApplyRegenGate()
+        ResetRespawnDamageState(false)
     end)
 end)
 

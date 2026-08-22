@@ -322,6 +322,7 @@ end)
 --   * the player consumes a health item (bandage / medkit) — handled in the
 --     useItem handler above where we already detect itemConfig.stat='health'.
 -- bleedRate modifier scales the time between drain ticks (lower = stops faster).
+local coldState = {}  -- [src] = { lastTickAt, inZoneAt, notifiedDamage }
 local bleedState = BleedingState.New()
 local bleedingPlayers = bleedState.players  -- [src] = { startedAt = ms, lastDrainAt = ms }
 
@@ -341,6 +342,31 @@ local function StopBleeding(src, silent)
     end
     TriggerClientEvent('corex-survival:client:onBleedStop', src)
 end
+
+local function ResetPlayerDamageState(src)
+    src = tonumber(src)
+    if not src then return false end
+
+    local wasBleeding = BleedingState.IsBleeding(bleedState, src)
+    StopBleeding(src, true)
+    BleedingState.Reset(bleedState, src)
+    coldState[src] = nil
+
+    SetStat(src, 'cold', 0)
+    SetStat(src, 'bleeding', 0)
+    SyncStat(src, 'cold', 0)
+    SyncStat(src, 'bleeding', 0)
+
+    -- Force both client flags off even when the server table was already
+    -- empty, which is exactly the stale-client case seen after a reconnect.
+    if not wasBleeding then
+        TriggerClientEvent('corex-survival:client:onBleedStop', src)
+    end
+    TriggerClientEvent('corex-survival:client:onColdLeave', src)
+    return true, wasBleeding
+end
+
+exports('ResetPlayerDamageState', ResetPlayerDamageState)
 
 -- The client supplies two HP samples. The server verifies the reported final
 -- sample against the authoritative ped health and rate-limits accepted reports.
@@ -409,10 +435,7 @@ end)
 -- corex-death emits this local server event for every normal and emergency death.
 -- Clearing here prevents a reconnect/respawn from inheriting a stale bleed.
 AddEventHandler('corex-spawn:server:playerDied', function(src)
-    src = tonumber(src)
-    if not src then return end
-    StopBleeding(src, true)
-    BleedingState.Reset(bleedState, src)
+    ResetPlayerDamageState(src)
 end)
 
 -- =============================================================================
@@ -423,8 +446,6 @@ end)
 -- Config.Cold.damageThreshold, HP starts dropping. The HUD's blue snowflake
 -- meter is driven by the existing 'cold' state-bag key, so just keeping the
 -- stat updated server-side is enough for the visual.
-local coldState = {}  -- [src] = { lastTickAt, inZoneAt, notifiedDamage }
-
 local function IsInColdArea(coords)
     if not Config.Cold or not Config.Cold.enabled then return false, 1.0 end
     if not coords then return false, 1.0 end
